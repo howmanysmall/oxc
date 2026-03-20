@@ -7,6 +7,8 @@ use std::{
     sync::Arc,
 };
 
+use rustc_hash::FxHashSet;
+
 use oxc_allocator::Box as ArenaBox;
 use oxc_diagnostics::{OxcDiagnostic, Severity};
 use oxc_parser::Token;
@@ -16,7 +18,10 @@ use oxc_span::{SourceType, Span};
 use crate::{
     AllowWarnDeny, FrameworkFlags,
     config::{LintConfig, LintPlugins, OxlintEnv, OxlintGlobals, OxlintSettings},
-    disable_directives::{DisableDirectives, DisableDirectivesBuilder, RuleCommentType},
+    disable_directives::{
+        DisableDirectives, DisableDirectivesBuilder, RuleCommentType,
+        filter_unused_disable_comments,
+    },
     fixer::{Fix, FixKind, Message, PossibleFixes},
     frameworks::{self, FrameworkOptions},
     module_record::ModuleRecord,
@@ -324,6 +329,91 @@ impl<'a> ContextHost<'a> {
         // report unused disable
         // relate to lint result, check after linter run finish
         let unused_disable_comments = self.disable_directives().collect_unused_disable_comments();
+        let message_for_disable = "Unused eslint-disable directive (no problems were reported).";
+        let fix_message = "remove unused disable directive";
+        let source_text = self.semantic().source_text();
+
+        for unused_disable_comment in unused_disable_comments {
+            let span = unused_disable_comment.span;
+            match &unused_disable_comment.r#type {
+                RuleCommentType::All => {
+                    // eslint-disable
+                    self.push_diagnostic(Message::new(
+                        OxcDiagnostic::error(message_for_disable)
+                            .with_label(span)
+                            .with_severity(rule_severity),
+                        PossibleFixes::Single(
+                            Fix::delete(span)
+                                .with_kind(FixKind::Suggestion)
+                                .with_message(fix_message),
+                        ),
+                    ));
+                }
+                RuleCommentType::Single(rules_vec) => {
+                    for rule in rules_vec {
+                        let rule_message = Cow::<str>::Owned(format!(
+                            "Unused eslint-disable directive (no problems were reported from {}).",
+                            rule.rule_name
+                        ));
+
+                        let fix = rule.create_fix(source_text, span).with_message(fix_message);
+
+                        self.push_diagnostic(Message::new(
+                            OxcDiagnostic::error(rule_message)
+                                .with_label(rule.name_span)
+                                .with_severity(rule_severity),
+                            PossibleFixes::Single(fix),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let unused_enable_comments = self.disable_directives().unused_enable_comments();
+        let mut unused_directive_diagnostics: Vec<(Cow<str>, Span)> =
+            Vec::with_capacity(unused_enable_comments.len());
+        // report unused enable
+        // not relate to lint result, check during comment directives' construction
+        let message_for_enable =
+            "Unused eslint-enable directive (no matching eslint-disable directives were found).";
+        for (rule_name, enable_comment_span) in self.disable_directives().unused_enable_comments() {
+            unused_directive_diagnostics.push((
+                rule_name.as_ref().map_or(Cow::Borrowed(message_for_enable), |name| {
+                    Cow::Owned(format!(
+                        "Unused eslint-enable directive (no matching eslint-disable directives were found for {name})."
+                    ))
+                }),
+                *enable_comment_span,
+            ));
+        }
+
+        self.append_diagnostics(
+            unused_directive_diagnostics
+                .into_iter()
+                .map(|(message, span)| {
+                    Message::new(
+                        OxcDiagnostic::error(message).with_label(span).with_severity(rule_severity),
+                        // TODO: fixer
+                        // copy the structure of disable directives
+                        PossibleFixes::None,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    pub fn report_unused_directives_with_owned_rules(
+        &self,
+        rule_severity: Severity,
+        owned_rules: &FxHashSet<String>,
+    ) {
+        // report unused disable
+        // relate to lint result, check after linter run finish
+        let unused_disable_comments = filter_unused_disable_comments(
+            self.disable_directives(),
+            self.disable_directives().collect_unused_disable_comments(),
+            |rule_name| owned_rules.contains(rule_name),
+        );
         let message_for_disable = "Unused eslint-disable directive (no problems were reported).";
         let fix_message = "remove unused disable directive";
         let source_text = self.semantic().source_text();

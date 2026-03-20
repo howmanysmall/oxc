@@ -141,9 +141,7 @@ impl RuleCommentRule {
             .with_kind(FixKind::Suggestion);
         }
 
-        unreachable!(
-            "A `RuleCommentRule` should have a comma, because only one rule should be RuleCommentType::All"
-        );
+        Fix::delete(comment_span).with_kind(FixKind::Suggestion)
     }
 }
 
@@ -1011,6 +1009,18 @@ pub fn create_unused_directives_diagnostics(
     directives: &DisableDirectives,
     severity: crate::AllowWarnDeny,
 ) -> Vec<oxc_diagnostics::OxcDiagnostic> {
+    create_unused_directives_diagnostics_from_unused_disable_comments(
+        directives,
+        directives.collect_unused_disable_comments(),
+        severity,
+    )
+}
+
+pub fn create_unused_directives_diagnostics_from_unused_disable_comments(
+    directives: &DisableDirectives,
+    unused_disable: Vec<DisableRuleComment>,
+    severity: crate::AllowWarnDeny,
+) -> Vec<oxc_diagnostics::OxcDiagnostic> {
     use oxc_diagnostics::OxcDiagnostic;
 
     let mut diagnostics = Vec::new();
@@ -1022,7 +1032,6 @@ pub fn create_unused_directives_diagnostics(
     };
 
     // Report unused disable comments
-    let unused_disable = directives.collect_unused_disable_comments();
     for unused_comment in unused_disable {
         let span = unused_comment.span;
         match unused_comment.r#type {
@@ -1068,6 +1077,76 @@ pub fn create_unused_directives_diagnostics(
     diagnostics
 }
 
+/// Filter unused disable comments, keeping only those whose rule names are in `owned_rules`.
+///
+/// This is used by the unused-disable-directive reporter to exclude foreign ESLint rules
+/// (rules Oxlint does not implement) from being reported as unused.
+///
+/// # Arguments
+/// * `unused_comments` - Result of `collect_unused_disable_comments()`
+/// * `owned_rules` - Set of rule names that Oxlint owns (e.g. from `ResolvedLinterState.rules`)
+///
+/// # Returns
+/// Filtered `Vec<DisableRuleComment>` with only owned-rule entries kept
+pub fn filter_unused_disable_comments(
+    directives: &DisableDirectives,
+    unused_comments: Vec<DisableRuleComment>,
+    owned_rules: impl Fn(&str) -> bool,
+) -> Vec<DisableRuleComment> {
+    unused_comments
+        .into_iter()
+        .filter_map(|comment| match comment.r#type {
+            RuleCommentType::All => directives
+                .disable_rule_comments()
+                .iter()
+                .find(|directive| directive.span == comment.span)
+                .and_then(|directive| match &directive.r#type {
+                    RuleCommentType::All => Some(comment),
+                    RuleCommentType::Single(rules_vec) => {
+                        let filtered_rules = rules_vec
+                            .iter()
+                            .filter(|rule| {
+                                rule.rule_name.rsplit_once('/').map_or_else(
+                                    || owned_rules(rule.rule_name.as_str()),
+                                    |(_, suffix)| owned_rules(suffix),
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        if filtered_rules.is_empty() {
+                            None
+                        } else {
+                            Some(DisableRuleComment {
+                                span: comment.span,
+                                r#type: RuleCommentType::Single(filtered_rules),
+                            })
+                        }
+                    }
+                }),
+            RuleCommentType::Single(rules_vec) => {
+                let filtered_rules: Vec<RuleCommentRule> = rules_vec
+                    .into_iter()
+                    .filter(|rule| {
+                        rule.rule_name.rsplit_once('/').map_or_else(
+                            || owned_rules(rule.rule_name.as_str()),
+                            |(_, suffix)| owned_rules(suffix),
+                        )
+                    })
+                    .collect();
+                if filtered_rules.is_empty() {
+                    None
+                } else {
+                    Some(DisableRuleComment {
+                        span: comment.span,
+                        r#type: RuleCommentType::Single(filtered_rules),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use oxc_allocator::Allocator;
@@ -1075,6 +1154,7 @@ mod tests {
     use oxc_parser::Parser;
     use oxc_semantic::{Semantic, SemanticBuilder};
     use oxc_span::{SourceType, Span};
+    use rustc_hash::FxHashSet;
 
     use crate::disable_directives::{DisabledRule, RuleCommentRule, RuleCommentType};
 
@@ -1323,18 +1403,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "A `RuleCommentRule` should have a comma, because only one rule should be RuleCommentType::All"
-    )]
     #[expect(clippy::cast_possible_truncation)] // for `as u32`
-    fn test_rule_comment_rule_create_fix_panic() {
-        // This test is expected to panic because it is a standalone rule.
-        // Standalone rules should be `RuleCommentType::All`.
+    fn test_rule_comment_rule_create_fix_single_rule_no_comma() {
         let source_text = "// eslint-disable-next-line max-params";
         let comment_span = Span::sized(3, source_text.len() as u32 - 3);
 
-        RuleCommentRule { rule_name: "max-params".to_string(), name_span: Span::sized(28, 10) }
-            .create_fix(source_text, comment_span);
+        let fix =
+            RuleCommentRule { rule_name: "max-params".to_string(), name_span: Span::sized(28, 10) }
+                .create_fix(source_text, comment_span);
+
+        assert_eq!(fix.span, comment_span);
     }
 
     #[test]
@@ -1380,6 +1458,138 @@ function test() {
         assert!(
             !directives.contains("no-console", second_console_log_span),
             "eslint-disable-next-line should NOT suppress diagnostics on lines after the next line"
+        );
+    }
+
+    #[test]
+    fn test_foreign_rules_not_reported_as_unused_disable() {
+        // Regression test: foreign ESLint rules (rules Oxlint doesn't implement)
+        // should NOT be reported as unused disable directives.
+        // See: https://github.com/oxc-project/oxc/issues/20375
+
+        // Case 1: Mixed foreign + known Oxlint rule (both unused)
+        // Only the Oxlint rule should be reported
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line no-console, no-unused-vars */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules: FxHashSet<String> =
+                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+
+                // Raw: both no-console and no-unused-vars appear as unused
+                assert_eq!(unused.len(), 1);
+                if let RuleCommentType::Single(rules) = &unused[0].r#type {
+                    assert_eq!(rules.len(), 2, "should have 2 rules in raw unused comments");
+                }
+
+                // Filtered: only no-console should remain
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
+                        owned_rules.contains(rule_name)
+                    });
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "no-console");
+                }
+            },
+        );
+
+        // Case 2: Scoped foreign rule (plugin/rule format)
+        // `prettier/prettier` is not owned by Oxlint, so it should be filtered out
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line no-console, prettier/prettier */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules: FxHashSet<String> =
+                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+
+                // Raw: both should appear as unused
+                assert_eq!(unused.len(), 1);
+                if let RuleCommentType::Single(rules) = &unused[0].r#type {
+                    assert_eq!(rules.len(), 2, "should have 2 rules in raw unused comments");
+                }
+
+                // Filtered: only no-console (prettier is filtered out because suffix doesn't match)
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
+                        owned_rules.contains(rule_name)
+                    });
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "no-console");
+                }
+            },
+        );
+
+        // Case 3: RuleCommentType::All should always be kept
+        // `disable-all` comments should never be filtered out
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules: FxHashSet<String> =
+                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+
+                // Should have a RuleCommentType::All
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(&unused[0].r#type, RuleCommentType::All));
+
+                // After filtering, RuleCommentType::All should still be present
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
+                        owned_rules.contains(rule_name)
+                    });
+                assert_eq!(filtered.len(), 1);
+                assert!(matches!(&filtered[0].r#type, RuleCommentType::All));
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable better-max-params/better-max-params */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules: FxHashSet<String> =
+                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
+                        owned_rules.contains(rule_name)
+                    });
+                assert!(filtered.is_empty());
+            },
         );
     }
 }
