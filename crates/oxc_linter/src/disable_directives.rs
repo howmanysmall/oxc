@@ -81,13 +81,13 @@ fn disabled_rule_matches_name(disabled_rule_name: &str, rule_name: &str) -> bool
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct OwnedRuleNames {
+pub struct OwnedRuleNames {
     builtin_rules: FxHashSet<String>,
     external_rules: FxHashSet<String>,
 }
 
 impl OwnedRuleNames {
-    pub(crate) fn new<BuiltinRules, ExternalRules>(
+    pub fn new<BuiltinRules, ExternalRules>(
         builtin_rules: BuiltinRules,
         external_rules: ExternalRules,
     ) -> Self
@@ -103,7 +103,7 @@ impl OwnedRuleNames {
         }
     }
 
-    pub(crate) fn contains_directive(&self, directive_rule_name: &str) -> bool {
+    pub fn contains_directive(&self, directive_rule_name: &str) -> bool {
         // Exact match (handles both unscoped builtins and fully-qualified externals)
         if self.builtin_rules.contains(directive_rule_name)
             || self.external_rules.contains(directive_rule_name)
@@ -112,10 +112,10 @@ impl OwnedRuleNames {
         }
 
         // Scoped directive (e.g., "typescript-eslint/no-unused-vars"): match suffix against builtins
-        if let Some((_, suffix)) = directive_rule_name.rsplit_once('/') {
-            if self.builtin_rules.contains(suffix) {
-                return true;
-            }
+        if let Some((_, suffix)) = directive_rule_name.rsplit_once('/')
+            && self.builtin_rules.contains(suffix)
+        {
+            return true;
         }
 
         // Special case: vitest/no-restricted-vi-methods → jest/no-restricted-jest-methods
@@ -1137,7 +1137,7 @@ pub fn create_unused_directives_diagnostics_from_unused_disable_comments(
 ///
 /// # Returns
 /// Filtered `Vec<DisableRuleComment>` with only owned-rule entries kept
-pub(crate) fn filter_unused_disable_comments(
+pub fn filter_unused_disable_comments(
     directives: &DisableDirectives,
     unused_comments: Vec<DisableRuleComment>,
     owned_rules: &OwnedRuleNames,
