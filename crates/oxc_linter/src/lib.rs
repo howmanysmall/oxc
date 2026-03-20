@@ -14,8 +14,6 @@ use std::{
     string::ToString,
 };
 
-use rustc_hash::FxHashSet;
-
 use oxc_allocator::{Allocator, AllocatorPool, CloneIn, TakeIn, Vec as ArenaVec};
 use oxc_ast::{
     ast::{Comment, CommentKind, Program},
@@ -66,7 +64,7 @@ mod lint_runner;
 pub use crate::config::plugins::normalize_plugin_name;
 pub use crate::disable_directives::{
     DisableDirectives, DisableRuleComment, RuleCommentRule, RuleCommentType,
-    create_unused_directives_diagnostics, filter_unused_disable_comments,
+    create_unused_directives_diagnostics,
 };
 pub use crate::{
     config::{
@@ -198,10 +196,8 @@ impl Linter {
         allocator: &'a Allocator,
         js_allocator_pool: Option<&AllocatorPool>,
     ) -> (Vec<Message>, Option<DisableDirectives>) {
-        let ResolvedLinterState { rules, config, external_rules } = self.config.resolve(path);
-
-        let owned_rules: FxHashSet<String> =
-            rules.iter().map(|(rule_enum, _)| rule_enum.name().to_string()).collect();
+        let ResolvedLinterState { rules: rules_from_resolved, config, external_rules } =
+            self.config.resolve(path);
 
         let mut ctx_host = Rc::new(ContextHost::new(path, context_sub_hosts, self.options, config));
 
@@ -214,7 +210,7 @@ impl Linter {
 
         loop {
             let semantic = ctx_host.semantic();
-            let rules = rules
+            let rules = rules_from_resolved
                 .iter()
                 .filter(|(rule, _)| {
                     if rule.is_tsgolint_rule() {
@@ -404,6 +400,10 @@ impl Linter {
                 && severity.is_warn_deny()
                 && is_partial_loader_file
             {
+                let owned_rules = self.config.collect_owned_rule_names(
+                    rules_from_resolved.as_ref(),
+                    external_rules.as_ref(),
+                );
                 ctx_host.report_unused_directives_with_owned_rules(severity.into(), &owned_rules);
             }
 

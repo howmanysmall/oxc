@@ -4,7 +4,7 @@ use itertools::Itertools;
 use oxc_ast::Comment;
 use oxc_span::Span;
 use rust_lapper::{Interval, Lapper};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{FixKind, fixer::Fix};
 
@@ -66,6 +66,61 @@ impl DisabledRule {
                 *is_next_line
             }
         }
+    }
+}
+
+fn disabled_rule_matches_name(disabled_rule_name: &str, rule_name: &str) -> bool {
+    if disabled_rule_name.contains(rule_name) {
+        return true;
+    }
+
+    // Special-case mapping: `vitest/no-restricted-vi-methods` is implemented by
+    // `jest/no-restricted-jest-methods`.
+    disabled_rule_name == "vitest/no-restricted-vi-methods"
+        && rule_name == "no-restricted-jest-methods"
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OwnedRuleNames {
+    builtin_rules: FxHashSet<String>,
+    external_rules: FxHashSet<String>,
+}
+
+impl OwnedRuleNames {
+    pub(crate) fn new<BuiltinRules, ExternalRules>(
+        builtin_rules: BuiltinRules,
+        external_rules: ExternalRules,
+    ) -> Self
+    where
+        BuiltinRules: IntoIterator,
+        BuiltinRules::Item: Into<String>,
+        ExternalRules: IntoIterator,
+        ExternalRules::Item: Into<String>,
+    {
+        Self {
+            builtin_rules: builtin_rules.into_iter().map(Into::into).collect(),
+            external_rules: external_rules.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub(crate) fn contains_directive(&self, directive_rule_name: &str) -> bool {
+        // Exact match (handles both unscoped builtins and fully-qualified externals)
+        if self.builtin_rules.contains(directive_rule_name)
+            || self.external_rules.contains(directive_rule_name)
+        {
+            return true;
+        }
+
+        // Scoped directive (e.g., "typescript-eslint/no-unused-vars"): match suffix against builtins
+        if let Some((_, suffix)) = directive_rule_name.rsplit_once('/') {
+            if self.builtin_rules.contains(suffix) {
+                return true;
+            }
+        }
+
+        // Special case: vitest/no-restricted-vi-methods → jest/no-restricted-jest-methods
+        directive_rule_name == "vitest/no-restricted-vi-methods"
+            && self.builtin_rules.contains("no-restricted-jest-methods")
     }
 }
 
@@ -201,13 +256,7 @@ impl DisableDirectives {
                 // This enables matching rules across different plugins that share the same
                 // rule name, such as jest<->vitest rules and eslint<->typescript rules.
                 DisabledRule::Single { rule_name: name, .. } => {
-                    if name.contains(rule_name) {
-                        true
-                    } else {
-                        // Special-case mapping: `vitest/no-restricted-vi-methods` is implemented by `jest/no-restricted-jest-methods`.
-                        name == "vitest/no-restricted-vi-methods"
-                            && rule_name == "no-restricted-jest-methods"
-                    }
+                    disabled_rule_matches_name(name, rule_name)
                 }
             };
 
@@ -1084,14 +1133,14 @@ pub fn create_unused_directives_diagnostics_from_unused_disable_comments(
 ///
 /// # Arguments
 /// * `unused_comments` - Result of `collect_unused_disable_comments()`
-/// * `owned_rules` - Set of rule names that Oxlint owns (e.g. from `ResolvedLinterState.rules`)
+/// * `owned_rules` - Built-in and external rule names that Oxlint owns
 ///
 /// # Returns
 /// Filtered `Vec<DisableRuleComment>` with only owned-rule entries kept
-pub fn filter_unused_disable_comments(
+pub(crate) fn filter_unused_disable_comments(
     directives: &DisableDirectives,
     unused_comments: Vec<DisableRuleComment>,
-    owned_rules: impl Fn(&str) -> bool,
+    owned_rules: &OwnedRuleNames,
 ) -> Vec<DisableRuleComment> {
     unused_comments
         .into_iter()
@@ -1105,12 +1154,7 @@ pub fn filter_unused_disable_comments(
                     RuleCommentType::Single(rules_vec) => {
                         let filtered_rules = rules_vec
                             .iter()
-                            .filter(|rule| {
-                                rule.rule_name.rsplit_once('/').map_or_else(
-                                    || owned_rules(rule.rule_name.as_str()),
-                                    |(_, suffix)| owned_rules(suffix),
-                                )
-                            })
+                            .filter(|rule| owned_rules.contains_directive(rule.rule_name.as_str()))
                             .cloned()
                             .collect::<Vec<_>>();
 
@@ -1127,12 +1171,7 @@ pub fn filter_unused_disable_comments(
             RuleCommentType::Single(rules_vec) => {
                 let filtered_rules: Vec<RuleCommentRule> = rules_vec
                     .into_iter()
-                    .filter(|rule| {
-                        rule.rule_name.rsplit_once('/').map_or_else(
-                            || owned_rules(rule.rule_name.as_str()),
-                            |(_, suffix)| owned_rules(suffix),
-                        )
-                    })
+                    .filter(|rule| owned_rules.contains_directive(rule.rule_name.as_str()))
                     .collect();
                 if filtered_rules.is_empty() {
                     None
@@ -1154,11 +1193,10 @@ mod tests {
     use oxc_parser::Parser;
     use oxc_semantic::{Semantic, SemanticBuilder};
     use oxc_span::{SourceType, Span};
-    use rustc_hash::FxHashSet;
 
     use crate::disable_directives::{DisabledRule, RuleCommentRule, RuleCommentType};
 
-    use super::{DisableDirectives, DisableDirectivesBuilder};
+    use super::{DisableDirectives, DisableDirectivesBuilder, OwnedRuleNames};
 
     fn process_source<'a>(allocator: &'a Allocator, source_text: &'a str) -> Semantic<'a> {
         let source_type = SourceType::default();
@@ -1480,8 +1518,8 @@ function test() {
             },
             |_comments, directives| {
                 let unused = directives.collect_unused_disable_comments();
-                let owned_rules: FxHashSet<String> =
-                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
 
                 // Raw: both no-console and no-unused-vars appear as unused
                 assert_eq!(unused.len(), 1);
@@ -1491,9 +1529,7 @@ function test() {
 
                 // Filtered: only no-console should remain
                 let filtered =
-                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
-                        owned_rules.contains(rule_name)
-                    });
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert_eq!(filtered.len(), 1);
                 if let RuleCommentType::Single(rules) = &filtered[0].r#type {
                     assert_eq!(rules.len(), 1);
@@ -1515,8 +1551,8 @@ function test() {
             },
             |_comments, directives| {
                 let unused = directives.collect_unused_disable_comments();
-                let owned_rules: FxHashSet<String> =
-                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
 
                 // Raw: both should appear as unused
                 assert_eq!(unused.len(), 1);
@@ -1526,9 +1562,7 @@ function test() {
 
                 // Filtered: only no-console (prettier is filtered out because suffix doesn't match)
                 let filtered =
-                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
-                        owned_rules.contains(rule_name)
-                    });
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert_eq!(filtered.len(), 1);
                 if let RuleCommentType::Single(rules) = &filtered[0].r#type {
                     assert_eq!(rules.len(), 1);
@@ -1550,8 +1584,8 @@ function test() {
             },
             |_comments, directives| {
                 let unused = directives.collect_unused_disable_comments();
-                let owned_rules: FxHashSet<String> =
-                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
 
                 // Should have a RuleCommentType::All
                 assert_eq!(unused.len(), 1);
@@ -1559,9 +1593,7 @@ function test() {
 
                 // After filtering, RuleCommentType::All should still be present
                 let filtered =
-                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
-                        owned_rules.contains(rule_name)
-                    });
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert_eq!(filtered.len(), 1);
                 assert!(matches!(&filtered[0].r#type, RuleCommentType::All));
             },
@@ -1578,17 +1610,73 @@ function test() {
             },
             |_comments, directives| {
                 let unused = directives.collect_unused_disable_comments();
-                let owned_rules: FxHashSet<String> =
-                    ["no-console".into(), "no-debugger".into()].into_iter().collect();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
 
                 assert_eq!(unused.len(), 1);
                 assert!(matches!(unused[0].r#type, RuleCommentType::All));
 
                 let filtered =
-                    super::filter_unused_disable_comments(&directives, unused, |rule_name| {
-                        owned_rules.contains(rule_name)
-                    });
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert!(filtered.is_empty());
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable custom/no-debugger */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(std::iter::empty::<&str>(), ["custom/no-debugger"]);
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "custom/no-debugger");
+                } else {
+                    panic!("expected the single custom rule to remain after filtering");
+                }
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable vitest/no-restricted-vi-methods */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-restricted-jest-methods"], std::iter::empty::<&str>());
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "vitest/no-restricted-vi-methods");
+                } else {
+                    panic!("expected the vitest alias rule to remain after filtering");
+                }
             },
         );
     }

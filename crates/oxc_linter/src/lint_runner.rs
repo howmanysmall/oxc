@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use oxc_diagnostics::{DiagnosticSender, DiagnosticService};
 use oxc_span::Span;
@@ -94,24 +94,18 @@ impl DirectivesStore {
         cwd: &Path,
         tx_error: &DiagnosticSender,
     ) {
-        use crate::{
-            disable_directives::create_unused_directives_diagnostics_from_unused_disable_comments,
+        use crate::disable_directives::{
+            create_unused_directives_diagnostics_from_unused_disable_comments,
             filter_unused_disable_comments,
         };
 
         let map = self.map.lock().expect("DirectivesStore mutex poisoned in report_unused");
         for (path, directives) in map.iter() {
-            let owned_rules: FxHashSet<String> = linter
-                .config()
-                .resolve(path)
-                .rules
-                .iter()
-                .map(|(rule, _)| rule.name().to_string())
-                .collect();
+            let owned_rules = linter.config().resolve_owned_rule_names(path);
             let unused_disable_comments = filter_unused_disable_comments(
                 directives,
                 directives.collect_unused_disable_comments(),
-                |rule_name| owned_rules.contains(rule_name),
+                &owned_rules,
             );
             let diagnostics = create_unused_directives_diagnostics_from_unused_disable_comments(
                 directives,
