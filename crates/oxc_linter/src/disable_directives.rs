@@ -8,6 +8,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{FixKind, fixer::Fix};
 
+/// Returns the target rule name if the given directive is a known alias.
+/// Returns `None` if not an alias.
+///
+/// Currently handles: `vitest/no-restricted-vi-methods` → `no-restricted-jest-methods`
+fn resolve_alias_target(directive_rule_name: &str) -> Option<&'static str> {
+    match directive_rule_name {
+        "vitest/no-restricted-vi-methods" => Some("no-restricted-jest-methods"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum DisabledRule {
     /// Disables all linting rules for a span of code.
@@ -74,10 +85,8 @@ fn disabled_rule_matches_name(disabled_rule_name: &str, rule_name: &str) -> bool
         return true;
     }
 
-    // Special-case mapping: `vitest/no-restricted-vi-methods` is implemented by
-    // `jest/no-restricted-jest-methods`.
-    disabled_rule_name == "vitest/no-restricted-vi-methods"
-        && rule_name == "no-restricted-jest-methods"
+    // Check if this is a known alias that maps to the target rule
+    resolve_alias_target(disabled_rule_name).is_some_and(|target| target == rule_name)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -118,9 +127,9 @@ impl OwnedRuleNames {
             return true;
         }
 
-        // Special case: vitest/no-restricted-vi-methods → jest/no-restricted-jest-methods
-        directive_rule_name == "vitest/no-restricted-vi-methods"
-            && self.builtin_rules.contains("no-restricted-jest-methods")
+        // Check if this is a known alias whose target is owned
+        resolve_alias_target(directive_rule_name)
+            .is_some_and(|target| self.builtin_rules.contains(target))
     }
 }
 
@@ -1642,12 +1651,10 @@ function test() {
                 let filtered =
                     super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert_eq!(filtered.len(), 1);
-                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
-                    assert_eq!(rules.len(), 1);
-                    assert_eq!(rules[0].rule_name, "custom/no-debugger");
-                } else {
-                    panic!("expected the single custom rule to remain after filtering");
-                }
+                assert!(
+                    matches!(&filtered[0].r#type, RuleCommentType::Single(rules) if rules.len() == 1 && rules[0].rule_name == "custom/no-debugger"),
+                    "expected the single custom rule to remain after filtering"
+                );
             },
         );
 
@@ -1671,12 +1678,35 @@ function test() {
                 let filtered =
                     super::filter_unused_disable_comments(&directives, unused, &owned_rules);
                 assert_eq!(filtered.len(), 1);
-                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
-                    assert_eq!(rules.len(), 1);
-                    assert_eq!(rules[0].rule_name, "vitest/no-restricted-vi-methods");
-                } else {
-                    panic!("expected the vitest alias rule to remain after filtering");
-                }
+                assert!(
+                    matches!(&filtered[0].r#type, RuleCommentType::Single(rules) if rules.len() == 1 && rules[0].rule_name == "vitest/no-restricted-vi-methods"),
+                    "expected the vitest alias rule to remain after filtering"
+                );
+            },
+        );
+
+        // Case 7: Unknown scoped rule where suffix doesn't match any builtin
+        // `@custom/unknown-rule` should be filtered out since it's not owned
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable @custom/unknown-rule */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                assert_eq!(unused.len(), 1);
+
+                // Should be filtered out since @custom/unknown-rule is not owned
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert!(filtered.is_empty(), "unknown scoped rule should be filtered out");
             },
         );
     }
