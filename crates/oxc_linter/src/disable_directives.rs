@@ -4,9 +4,20 @@ use itertools::Itertools;
 use oxc_ast::Comment;
 use oxc_span::Span;
 use rust_lapper::{Interval, Lapper};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{FixKind, fixer::Fix};
+
+/// Returns the target rule name if the given directive is a known alias.
+/// Returns `None` if not an alias.
+///
+/// Currently handles: `vitest/no-restricted-vi-methods` → `no-restricted-jest-methods`
+fn resolve_alias_target(directive_rule_name: &str) -> Option<&'static str> {
+    match directive_rule_name {
+        "vitest/no-restricted-vi-methods" => Some("no-restricted-jest-methods"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum DisabledRule {
@@ -66,6 +77,59 @@ impl DisabledRule {
                 *is_next_line
             }
         }
+    }
+}
+
+fn disabled_rule_matches_name(disabled_rule_name: &str, rule_name: &str) -> bool {
+    if disabled_rule_name.contains(rule_name) {
+        return true;
+    }
+
+    // Check if this is a known alias that maps to the target rule
+    resolve_alias_target(disabled_rule_name).is_some_and(|target| target == rule_name)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OwnedRuleNames {
+    builtin_rules: FxHashSet<String>,
+    external_rules: FxHashSet<String>,
+}
+
+impl OwnedRuleNames {
+    pub fn new<BuiltinRules, ExternalRules>(
+        builtin_rules: BuiltinRules,
+        external_rules: ExternalRules,
+    ) -> Self
+    where
+        BuiltinRules: IntoIterator,
+        BuiltinRules::Item: Into<String>,
+        ExternalRules: IntoIterator,
+        ExternalRules::Item: Into<String>,
+    {
+        Self {
+            builtin_rules: builtin_rules.into_iter().map(Into::into).collect(),
+            external_rules: external_rules.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn contains_directive(&self, directive_rule_name: &str) -> bool {
+        // Exact match (handles both unscoped builtins and fully-qualified externals)
+        if self.builtin_rules.contains(directive_rule_name)
+            || self.external_rules.contains(directive_rule_name)
+        {
+            return true;
+        }
+
+        // Scoped directive (e.g., "typescript-eslint/no-unused-vars"): match suffix against builtins
+        if let Some((_, suffix)) = directive_rule_name.rsplit_once('/')
+            && self.builtin_rules.contains(suffix)
+        {
+            return true;
+        }
+
+        // Check if this is a known alias whose target is owned
+        resolve_alias_target(directive_rule_name)
+            .is_some_and(|target| self.builtin_rules.contains(target))
     }
 }
 
@@ -141,9 +205,7 @@ impl RuleCommentRule {
             .with_kind(FixKind::Suggestion);
         }
 
-        unreachable!(
-            "A `RuleCommentRule` should have a comma, because only one rule should be RuleCommentType::All"
-        );
+        Fix::delete(comment_span).with_kind(FixKind::Suggestion)
     }
 }
 
@@ -203,13 +265,7 @@ impl DisableDirectives {
                 // This enables matching rules across different plugins that share the same
                 // rule name, such as jest<->vitest rules and eslint<->typescript rules.
                 DisabledRule::Single { rule_name: name, .. } => {
-                    if name.contains(rule_name) {
-                        true
-                    } else {
-                        // Special-case mapping: `vitest/no-restricted-vi-methods` is implemented by `jest/no-restricted-jest-methods`.
-                        name == "vitest/no-restricted-vi-methods"
-                            && rule_name == "no-restricted-jest-methods"
-                    }
+                    disabled_rule_matches_name(name, rule_name)
                 }
             };
 
@@ -1011,6 +1067,18 @@ pub fn create_unused_directives_diagnostics(
     directives: &DisableDirectives,
     severity: crate::AllowWarnDeny,
 ) -> Vec<oxc_diagnostics::OxcDiagnostic> {
+    create_unused_directives_diagnostics_from_unused_disable_comments(
+        directives,
+        directives.collect_unused_disable_comments(),
+        severity,
+    )
+}
+
+pub fn create_unused_directives_diagnostics_from_unused_disable_comments(
+    directives: &DisableDirectives,
+    unused_disable: Vec<DisableRuleComment>,
+    severity: crate::AllowWarnDeny,
+) -> Vec<oxc_diagnostics::OxcDiagnostic> {
     use oxc_diagnostics::OxcDiagnostic;
 
     let mut diagnostics = Vec::new();
@@ -1022,7 +1090,6 @@ pub fn create_unused_directives_diagnostics(
     };
 
     // Report unused disable comments
-    let unused_disable = directives.collect_unused_disable_comments();
     for unused_comment in unused_disable {
         let span = unused_comment.span;
         match unused_comment.r#type {
@@ -1068,6 +1135,66 @@ pub fn create_unused_directives_diagnostics(
     diagnostics
 }
 
+/// Filter unused disable comments, keeping only those whose rule names are in `owned_rules`.
+///
+/// This is used by the unused-disable-directive reporter to exclude foreign ESLint rules
+/// (rules Oxlint does not implement) from being reported as unused.
+///
+/// # Arguments
+/// * `unused_comments` - Result of `collect_unused_disable_comments()`
+/// * `owned_rules` - Built-in and external rule names that Oxlint owns
+///
+/// # Returns
+/// Filtered `Vec<DisableRuleComment>` with only owned-rule entries kept
+pub fn filter_unused_disable_comments(
+    directives: &DisableDirectives,
+    unused_comments: Vec<DisableRuleComment>,
+    owned_rules: &OwnedRuleNames,
+) -> Vec<DisableRuleComment> {
+    unused_comments
+        .into_iter()
+        .filter_map(|comment| match comment.r#type {
+            RuleCommentType::All => directives
+                .disable_rule_comments()
+                .iter()
+                .find(|directive| directive.span == comment.span)
+                .and_then(|directive| match &directive.r#type {
+                    RuleCommentType::All => Some(comment),
+                    RuleCommentType::Single(rules_vec) => {
+                        let filtered_rules = rules_vec
+                            .iter()
+                            .filter(|rule| owned_rules.contains_directive(rule.rule_name.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        if filtered_rules.is_empty() {
+                            None
+                        } else {
+                            Some(DisableRuleComment {
+                                span: comment.span,
+                                r#type: RuleCommentType::Single(filtered_rules),
+                            })
+                        }
+                    }
+                }),
+            RuleCommentType::Single(rules_vec) => {
+                let filtered_rules: Vec<RuleCommentRule> = rules_vec
+                    .into_iter()
+                    .filter(|rule| owned_rules.contains_directive(rule.rule_name.as_str()))
+                    .collect();
+                if filtered_rules.is_empty() {
+                    None
+                } else {
+                    Some(DisableRuleComment {
+                        span: comment.span,
+                        r#type: RuleCommentType::Single(filtered_rules),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use oxc_allocator::Allocator;
@@ -1078,7 +1205,7 @@ mod tests {
 
     use crate::disable_directives::{DisabledRule, RuleCommentRule, RuleCommentType};
 
-    use super::{DisableDirectives, DisableDirectivesBuilder};
+    use super::{DisableDirectives, DisableDirectivesBuilder, OwnedRuleNames};
 
     fn process_source<'a>(allocator: &'a Allocator, source_text: &'a str) -> Semantic<'a> {
         let source_type = SourceType::default();
@@ -1323,18 +1450,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "A `RuleCommentRule` should have a comma, because only one rule should be RuleCommentType::All"
-    )]
     #[expect(clippy::cast_possible_truncation)] // for `as u32`
-    fn test_rule_comment_rule_create_fix_panic() {
-        // This test is expected to panic because it is a standalone rule.
-        // Standalone rules should be `RuleCommentType::All`.
+    fn test_rule_comment_rule_create_fix_single_rule_no_comma() {
         let source_text = "// eslint-disable-next-line max-params";
         let comment_span = Span::sized(3, source_text.len() as u32 - 3);
 
-        RuleCommentRule { rule_name: "max-params".to_string(), name_span: Span::sized(28, 10) }
-            .create_fix(source_text, comment_span);
+        let fix =
+            RuleCommentRule { rule_name: "max-params".to_string(), name_span: Span::sized(28, 10) }
+                .create_fix(source_text, comment_span);
+
+        assert_eq!(fix.span, comment_span);
     }
 
     #[test]
@@ -1380,6 +1505,209 @@ function test() {
         assert!(
             !directives.contains("no-console", second_console_log_span),
             "eslint-disable-next-line should NOT suppress diagnostics on lines after the next line"
+        );
+    }
+
+    #[test]
+    fn test_foreign_rules_not_reported_as_unused_disable() {
+        // Regression test: foreign ESLint rules (rules Oxlint doesn't implement)
+        // should NOT be reported as unused disable directives.
+        // See: https://github.com/oxc-project/oxc/issues/20375
+
+        // Case 1: Mixed foreign + known Oxlint rule (both unused)
+        // Only the Oxlint rule should be reported
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line no-console, no-unused-vars */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                // Raw: both no-console and no-unused-vars appear as unused
+                assert_eq!(unused.len(), 1);
+                if let RuleCommentType::Single(rules) = &unused[0].r#type {
+                    assert_eq!(rules.len(), 2, "should have 2 rules in raw unused comments");
+                }
+
+                // Filtered: only no-console should remain
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "no-console");
+                }
+            },
+        );
+
+        // Case 2: Scoped foreign rule (plugin/rule format)
+        // `prettier/prettier` is not owned by Oxlint, so it should be filtered out
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line no-console, prettier/prettier */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                // Raw: both should appear as unused
+                assert_eq!(unused.len(), 1);
+                if let RuleCommentType::Single(rules) = &unused[0].r#type {
+                    assert_eq!(rules.len(), 2, "should have 2 rules in raw unused comments");
+                }
+
+                // Filtered: only no-console (prettier is filtered out because suffix doesn't match)
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                if let RuleCommentType::Single(rules) = &filtered[0].r#type {
+                    assert_eq!(rules.len(), 1);
+                    assert_eq!(rules[0].rule_name, "no-console");
+                }
+            },
+        );
+
+        // Case 3: RuleCommentType::All should always be kept
+        // `disable-all` comments should never be filtered out
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable-next-line */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                // Should have a RuleCommentType::All
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(&unused[0].r#type, RuleCommentType::All));
+
+                // After filtering, RuleCommentType::All should still be present
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                assert!(matches!(&filtered[0].r#type, RuleCommentType::All));
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable better-max-params/better-max-params */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert!(filtered.is_empty());
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable custom/no-debugger */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(std::iter::empty::<&str>(), ["custom/no-debugger"]);
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                assert!(
+                    matches!(&filtered[0].r#type, RuleCommentType::Single(rules) if rules.len() == 1 && rules[0].rule_name == "custom/no-debugger"),
+                    "expected the single custom rule to remain after filtering"
+                );
+            },
+        );
+
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable vitest/no-restricted-vi-methods */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-restricted-jest-methods"], std::iter::empty::<&str>());
+
+                assert_eq!(unused.len(), 1);
+                assert!(matches!(unused[0].r#type, RuleCommentType::All));
+
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert_eq!(filtered.len(), 1);
+                assert!(
+                    matches!(&filtered[0].r#type, RuleCommentType::Single(rules) if rules.len() == 1 && rules[0].rule_name == "vitest/no-restricted-vi-methods"),
+                    "expected the vitest alias rule to remain after filtering"
+                );
+            },
+        );
+
+        // Case 7: Unknown scoped rule where suffix doesn't match any builtin
+        // `@custom/unknown-rule` should be filtered out since it's not owned
+        test_directives(
+            |prefix| {
+                format!(
+                    r"
+                    /* {prefix}-disable @custom/unknown-rule */
+                    const x = 1;
+                    "
+                )
+            },
+            |_comments, directives| {
+                let unused = directives.collect_unused_disable_comments();
+                let owned_rules =
+                    OwnedRuleNames::new(["no-console", "no-debugger"], std::iter::empty::<&str>());
+
+                assert_eq!(unused.len(), 1);
+
+                // Should be filtered out since @custom/unknown-rule is not owned
+                let filtered =
+                    super::filter_unused_disable_comments(&directives, unused, &owned_rules);
+                assert!(filtered.is_empty(), "unknown scoped rule should be filtered out");
+            },
         );
     }
 }

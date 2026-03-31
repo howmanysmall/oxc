@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rustc_hash::FxBuildHasher;
 use tower_lsp_server::ls_types::Uri;
 use tower_lsp_server::{LspService, Server, ls_types::ServerInfo};
@@ -11,6 +13,7 @@ mod options;
 mod tests;
 mod tool;
 mod worker;
+mod worker_manager;
 
 pub use crate::capabilities::{Capabilities, DiagnosticMode};
 pub use crate::language_id::LanguageId;
@@ -31,11 +34,7 @@ impl<'a> TextDocument<'a> {
 }
 
 /// Run the language server
-pub async fn run_server(
-    server_name: String,
-    server_version: String,
-    tools: Vec<Box<dyn ToolBuilder>>,
-) {
+pub async fn run_server(server_name: String, server_version: String, tool: Arc<dyn ToolBuilder>) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -43,7 +42,7 @@ pub async fn run_server(
         crate::backend::Backend::new(
             client,
             ServerInfo { name: server_name, version: Some(server_version) },
-            tools,
+            tool,
         )
     })
     .finish();

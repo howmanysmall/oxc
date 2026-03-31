@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     AllowWarnDeny,
+    disable_directives::OwnedRuleNames,
     external_plugin_store::{ExternalOptionsId, ExternalPluginStore, ExternalRuleId},
     rules::{RULES, RuleEnum},
 };
@@ -298,8 +299,7 @@ impl ConfigStore {
     /// Returns the total number of rules, inclusive of JS Plugin rules, optionally filtering out tsgolint rules if type_aware_enabled is false.
     pub fn number_of_rules(&self, type_aware_enabled: bool) -> Option<usize> {
         // If there are nested configs the number of rules may vary per-file, so return `None`.
-        // Note: this is `> 1` due to https://github.com/oxc-project/oxc/issues/16356
-        if self.nested_configs.len() > 1 {
+        if !self.nested_configs.is_empty() {
             return None;
         }
 
@@ -359,6 +359,25 @@ impl ConfigStore {
     // for the `tsgolint` linter.
     pub fn resolve(&self, path: &Path) -> ResolvedLinterState {
         Config::apply_overrides(self.get_related_config(path), path)
+    }
+
+    pub(crate) fn collect_owned_rule_names(
+        &self,
+        rules: &[(RuleEnum, AllowWarnDeny)],
+        external_rules: &[(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+    ) -> OwnedRuleNames {
+        OwnedRuleNames::new(
+            rules.iter().map(|(rule, _)| rule.name()),
+            external_rules.iter().map(|(external_rule_id, _, _)| {
+                let (plugin_name, rule_name) = self.resolve_plugin_rule_names(*external_rule_id);
+                format!("{plugin_name}/{rule_name}")
+            }),
+        )
+    }
+
+    pub(crate) fn resolve_owned_rule_names(&self, path: &Path) -> OwnedRuleNames {
+        let resolved = self.resolve(path);
+        self.collect_owned_rule_names(resolved.rules.as_ref(), resolved.external_rules.as_ref())
     }
 
     fn get_nearest_config(&self, path: &Path) -> Option<&Config> {
@@ -764,6 +783,33 @@ mod test {
     }
 
     #[test]
+    fn test_resolve_owned_rule_names_includes_external_rules() {
+        let mut external_plugin_store = ExternalPluginStore::default();
+        external_plugin_store.register_plugin(
+            "./plugin.js".into(),
+            "custom".into(),
+            0,
+            vec!["no-debugger".into()],
+        );
+
+        let rule_id = external_plugin_store.lookup_rule_id("custom", "no-debugger").unwrap();
+        let store = ConfigStore::new(
+            Config::new(
+                vec![],
+                vec![(rule_id, ExternalOptionsId::NONE, AllowWarnDeny::Warn)],
+                OxlintCategories::default(),
+                LintConfig::default(),
+                ResolvedOxlintOverrides::default(),
+            ),
+            FxHashMap::default(),
+            external_plugin_store,
+        );
+
+        let owned_rules = store.resolve_owned_rule_names("foo.js".as_ref());
+        assert!(owned_rules.contains_directive("custom/no-debugger"));
+    }
+
+    #[test]
     fn test_replace_globals() {
         let base_config = LintConfig {
             plugins: LintPlugins::ESLINT,
@@ -1069,9 +1115,6 @@ mod test {
             ConfigStore::new(base.clone(), FxHashMap::default(), ExternalPluginStore::default());
 
         let mut nested_configs = FxHashMap::default();
-        // Add the base config to nested_configs, as that's how it actually works right now.
-        // TODO: Can remove this addition of the base config when we fix https://github.com/oxc-project/oxc/issues/16356
-        nested_configs.insert(PathBuf::new(), base.clone());
         // Then add another so we have more than just the base config here.
         nested_configs.insert(PathBuf::from("nested"), base);
 

@@ -15,20 +15,12 @@ working directory: fixtures/cli/tsgolint_disable_directives
    `----
   help: Consider using this expression or removing it
 
-  ! Unused eslint-disable directive (no problems were reported).
-    ,-[unused.ts:9:3]
+  ! Unused eslint-disable directive (no problems were reported from typescript/no-floating-promises).
+    ,-[unused.ts:9:29]
   8 | // This disable directive is UNUSED (no error to suppress)
   9 | // oxlint-disable-next-line typescript/no-floating-promises
-    :   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    :                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
  10 | console.log("hello")
-    `----
-
-  ! Unused eslint-disable directive (no problems were reported).
-    ,-[unused.ts:13:3]
- 12 | // This disable directive is UNUSED (wrong rule name)
- 13 | // oxlint-disable-next-line typescript/no-unsafe-assignment
-    :   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
- 14 | myPromise
     `----
 
   ! eslint(no-unused-expressions): Expected expression to be used
@@ -68,15 +60,7 @@ working directory: fixtures/cli/tsgolint_disable_directives
     `----
   help: Consider removing this declaration.
 
-  ! Unused eslint-disable directive (no problems were reported).
-    ,-[unused.ts:24:3]
- 23 | const x = 1 + 2
- 24 | /* eslint-enable @typescript-eslint/no-floating-promises */
-    :   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
- 25 | 
-    `----
-
-Found 8 warnings and 0 errors.
+Found 6 warnings and 0 errors.
 Finished in <variable>ms on 1 file with 107 rules using 1 threads.
 ----------
 CLI result: LintSucceeded

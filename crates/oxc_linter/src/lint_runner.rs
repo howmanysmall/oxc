@@ -87,12 +87,31 @@ impl DirectivesStore {
     ///
     /// # Panics
     /// Panics if the mutex is poisoned or if sending to the error channel fails.
-    pub fn report_unused(&self, severity: AllowWarnDeny, cwd: &Path, tx_error: &DiagnosticSender) {
-        use crate::create_unused_directives_diagnostics;
+    pub fn report_unused(
+        &self,
+        linter: &Linter,
+        severity: AllowWarnDeny,
+        cwd: &Path,
+        tx_error: &DiagnosticSender,
+    ) {
+        use crate::disable_directives::{
+            create_unused_directives_diagnostics_from_unused_disable_comments,
+            filter_unused_disable_comments,
+        };
 
         let map = self.map.lock().expect("DirectivesStore mutex poisoned in report_unused");
         for (path, directives) in map.iter() {
-            let diagnostics = create_unused_directives_diagnostics(directives, severity);
+            let owned_rules = linter.config().resolve_owned_rule_names(path);
+            let unused_disable_comments = filter_unused_disable_comments(
+                directives,
+                directives.collect_unused_disable_comments(),
+                &owned_rules,
+            );
+            let diagnostics = create_unused_directives_diagnostics_from_unused_disable_comments(
+                directives,
+                unused_disable_comments,
+                severity,
+            );
 
             if !diagnostics.is_empty() {
                 let source_text = std::fs::read_to_string(path.as_path()).unwrap_or_default();
@@ -265,7 +284,12 @@ impl LintRunner {
         tx_error: &DiagnosticSender,
     ) {
         if let Some(severity) = severity {
-            self.directives_store.report_unused(severity, &self.cwd, tx_error);
+            self.directives_store.report_unused(
+                self.lint_service.linter(),
+                severity,
+                &self.cwd,
+                tx_error,
+            );
         }
     }
 

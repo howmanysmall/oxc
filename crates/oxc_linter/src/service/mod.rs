@@ -95,6 +95,10 @@ impl LintService {
         self.runtime.run_source(file_system, paths)
     }
 
+    pub(crate) fn linter(&self) -> &Linter {
+        &self.runtime.linter
+    }
+
     /// For tests
     #[cfg(test)]
     pub(crate) fn run_test_source(

@@ -16,7 +16,10 @@ use oxc_span::{SourceType, Span};
 use crate::{
     AllowWarnDeny, FrameworkFlags,
     config::{LintConfig, LintPlugins, OxlintEnv, OxlintGlobals, OxlintSettings},
-    disable_directives::{DisableDirectives, DisableDirectivesBuilder, RuleCommentType},
+    disable_directives::{
+        DisableDirectives, DisableDirectivesBuilder, OwnedRuleNames, RuleCommentType,
+        filter_unused_disable_comments,
+    },
     fixer::{Fix, FixKind, Message, PossibleFixes},
     frameworks::{self, FrameworkOptions},
     module_record::ModuleRecord,
@@ -321,9 +324,26 @@ impl<'a> ContextHost<'a> {
 
     /// report unused enable/disable directives, add these as Messages to diagnostics
     pub fn report_unused_directives(&self, rule_severity: Severity) {
+        self.report_unused_directives_impl(rule_severity, None);
+    }
+
+    fn report_unused_directives_impl(
+        &self,
+        rule_severity: Severity,
+        owned_rules: Option<&OwnedRuleNames>,
+    ) {
         // report unused disable
         // relate to lint result, check after linter run finish
-        let unused_disable_comments = self.disable_directives().collect_unused_disable_comments();
+        let unused_disable_comments = owned_rules.map_or_else(
+            || self.disable_directives().collect_unused_disable_comments(),
+            |owned_rules| {
+                filter_unused_disable_comments(
+                    self.disable_directives(),
+                    self.disable_directives().collect_unused_disable_comments(),
+                    owned_rules,
+                )
+            },
+        );
         let message_for_disable = "Unused eslint-disable directive (no problems were reported).";
         let fix_message = "remove unused disable directive";
         let source_text = self.semantic().source_text();
@@ -395,6 +415,14 @@ impl<'a> ContextHost<'a> {
                 })
                 .collect(),
         );
+    }
+
+    pub(crate) fn report_unused_directives_with_owned_rules(
+        &self,
+        rule_severity: Severity,
+        owned_rules: &OwnedRuleNames,
+    ) {
+        self.report_unused_directives_impl(rule_severity, Some(owned_rules));
     }
 
     /// Take ownership of all diagnostics collected during linting.

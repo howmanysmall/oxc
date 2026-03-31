@@ -153,6 +153,10 @@ impl Linter {
         &self.options
     }
 
+    pub(crate) fn config(&self) -> &ConfigStore {
+        &self.config
+    }
+
     /// Returns the number of rules that will are being used, unless there
     /// nested configurations in use, in which case it returns `None` since the
     /// number of rules depends on which file is being linted.
@@ -192,7 +196,8 @@ impl Linter {
         allocator: &'a Allocator,
         js_allocator_pool: Option<&AllocatorPool>,
     ) -> (Vec<Message>, Option<DisableDirectives>) {
-        let ResolvedLinterState { rules, config, external_rules } = self.config.resolve(path);
+        let ResolvedLinterState { rules: rules_from_resolved, config, external_rules } =
+            self.config.resolve(path);
 
         let mut ctx_host = Rc::new(ContextHost::new(path, context_sub_hosts, self.options, config));
 
@@ -205,7 +210,7 @@ impl Linter {
 
         loop {
             let semantic = ctx_host.semantic();
-            let rules = rules
+            let rules = rules_from_resolved
                 .iter()
                 .filter(|(rule, _)| {
                     if rule.is_tsgolint_rule() {
@@ -395,7 +400,11 @@ impl Linter {
                 && severity.is_warn_deny()
                 && is_partial_loader_file
             {
-                ctx_host.report_unused_directives(severity.into());
+                let owned_rules = self.config.collect_owned_rule_names(
+                    rules_from_resolved.as_ref(),
+                    external_rules.as_ref(),
+                );
+                ctx_host.report_unused_directives_with_owned_rules(severity.into(), &owned_rules);
             }
 
             // no next `<script>` block found, the complete file is finished linting
