@@ -967,6 +967,10 @@ mod test {
         Tester::new().with_cwd(temp_dir.path().to_path_buf()).test(args);
 
         assert!(fs::exists(&config_path).unwrap());
+
+        let content = fs::read_to_string(config_path).unwrap();
+
+        insta::assert_snapshot!("init_config", content);
     }
 
     #[test]
@@ -1532,6 +1536,13 @@ export { redundant };
     fn test_invalid_config_invalid_config_multiple_rules() {
         Tester::new()
             .with_cwd("fixtures/cli/invalid_config_multiple_rules".into())
+            .test_and_snapshot(&[]);
+    }
+
+    #[test]
+    fn test_invalid_config_missing_builtin_rule() {
+        Tester::new()
+            .with_cwd("fixtures/cli/invalid_config_missing_builtin_rule".into())
             .test_and_snapshot(&[]);
     }
 
