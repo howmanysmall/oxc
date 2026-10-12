@@ -10,8 +10,8 @@ use oxc_diagnostics::{DiagnosticSender, DiagnosticService};
 use oxc_span::Span;
 
 use crate::{
-    AllowWarnDeny, DisableDirectives, FixKind, LintService, LintServiceOptions, Linter, Message,
-    OsFileSystem, RuleTimingStore, TsGoLintState, suppression::DiffManager,
+    AllowWarnDeny, DisableDirectives, FixKind, LintCache, LintService, LintServiceOptions, Linter,
+    Message, OsFileSystem, RuleTimingStore, TsGoLintState, suppression::DiffManager,
 };
 
 /// Unified runner that orchestrates both regular (oxc) and type-aware (tsgolint) linting
@@ -26,6 +26,10 @@ pub struct LintRunner {
     /// Current working directory
     cwd: PathBuf,
     type_check_only: bool,
+    silent: bool,
+    /// Whether fixes are applied.
+    fix: bool,
+    cache: Option<Arc<LintCache>>,
 }
 
 /// Manages disable directives across all linting engines.
@@ -89,12 +93,26 @@ impl DirectivesStore {
     /// # Panics
     /// Panics if the mutex is poisoned or if sending to the error channel fails.
     pub fn report_unused(&self, severity: AllowWarnDeny, cwd: &Path, tx_error: &DiagnosticSender) {
+        self.report_unused_and_record(severity, cwd, tx_error, None);
+    }
+
+    /// Like [`DirectivesStore::report_unused`], also recording the diagnostics in `cache`.
+    fn report_unused_and_record(
+        &self,
+        severity: AllowWarnDeny,
+        cwd: &Path,
+        tx_error: &DiagnosticSender,
+        cache: Option<&LintCache>,
+    ) {
         use crate::create_unused_directives_diagnostics;
 
         let map = self.map.lock().expect("DirectivesStore mutex poisoned in report_unused");
         for (path, directives) in map.iter() {
             let diagnostics = create_unused_directives_diagnostics(directives, severity);
 
+            if let Some(cache) = cache {
+                cache.record(path, &diagnostics, false);
+            }
             if !diagnostics.is_empty() {
                 let source_text = std::fs::read_to_string(path.as_path()).unwrap_or_default();
                 let wrapped = DiagnosticService::wrap_diagnostics(
@@ -154,6 +172,7 @@ pub struct LintRunnerBuilder {
     type_check_only: bool,
     timings: bool,
     with_ignore_fixes: bool,
+    cache: Option<Arc<LintCache>>,
 }
 
 impl LintRunnerBuilder {
@@ -168,6 +187,7 @@ impl LintRunnerBuilder {
             type_check_only: false,
             timings: false,
             with_ignore_fixes: false,
+            cache: None,
         }
     }
 
@@ -213,6 +233,13 @@ impl LintRunnerBuilder {
         self
     }
 
+    /// Reuse cached results of unchanged files, and record results of linted files in `cache`.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Option<Arc<LintCache>>) -> Self {
+        self.cache = cache;
+        self
+    }
+
     /// # Errors
     /// Returns an error if the type-aware linter fails to initialize.
     pub fn build(self) -> Result<LintRunner, String> {
@@ -230,7 +257,8 @@ impl LintRunnerBuilder {
                         .with_type_check(self.type_check)
                         .with_type_check_only(self.type_check_only)
                         .with_timings(self.timings)
-                        .with_ignore_fixes(self.with_ignore_fixes),
+                        .with_ignore_fixes(self.with_ignore_fixes)
+                        .with_cache(self.cache.clone()),
                 ),
                 Err(e) => return Err(e),
             }
@@ -241,6 +269,7 @@ impl LintRunnerBuilder {
         let cwd = self.lint_service_options.cwd().to_path_buf();
         let mut lint_service = LintService::new(self.regular_linter, self.lint_service_options);
         lint_service.set_disable_directives_map(directives_coordinator.map());
+        lint_service.set_cache(self.cache.clone());
 
         Ok(LintRunner {
             lint_service,
@@ -248,6 +277,9 @@ impl LintRunnerBuilder {
             directives_store: directives_coordinator,
             cwd,
             type_check_only: self.type_check_only,
+            silent: self.silent,
+            fix: self.fix_kind != FixKind::None,
+            cache: self.cache,
         })
     }
 }
@@ -269,6 +301,17 @@ impl LintRunner {
         rule_timing_store: Option<&RuleTimingStore>,
     ) -> Result<Self, String> {
         let fs: &(dyn crate::RuntimeFileSystem + Sync + Send) = &OsFileSystem;
+
+        let files_to_lint;
+        let files = if let Some(cache) = &self.cache {
+            let config_store = &self.lint_service.linter().config;
+            let hits;
+            (files_to_lint, hits) = cache.partition(files, config_store, self.fix, self.silent);
+            cache.replay(hits, diff_manager, &tx_error);
+            &files_to_lint
+        } else {
+            files
+        };
 
         if self.type_check_only {
             self.lint_service.collect_parse_diagnostics(fs, files.to_owned(), &tx_error);
@@ -324,7 +367,12 @@ impl LintRunner {
         tx_error: &DiagnosticSender,
     ) {
         if let Some(severity) = severity {
-            self.directives_store.report_unused(severity, &self.cwd, tx_error);
+            self.directives_store.report_unused_and_record(
+                severity,
+                &self.cwd,
+                tx_error,
+                self.cache.as_deref(),
+            );
         }
     }
 

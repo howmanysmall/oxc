@@ -30,6 +30,7 @@ use oxc_semantic::{AstNode, Semantic};
 use oxc_span::Span;
 
 mod ast_util;
+mod cache;
 mod config;
 mod context;
 mod disable_directives;
@@ -70,6 +71,7 @@ pub use crate::disable_directives::{
     create_unused_directives_diagnostics,
 };
 pub use crate::{
+    cache::{CacheStrategy, Fingerprint, FingerprintHasher, LintCache},
     config::{
         Config, ConfigBuilderError, ConfigStore, ConfigStoreBuilder, ESLintRule, LintIgnoreMatcher,
         LintPlugins, Oxlintrc, ResolvedLinterState,
@@ -93,7 +95,7 @@ pub use crate::{
     service::{LintService, LintServiceOptions, OsFileSystem, RuntimeFileSystem},
     suppression::{OxlintSuppressionFileAction, SuppressionManager},
     timing::{RuleTimingRecord, RuleTimingSource, RuleTimingStore},
-    tsgolint::TsGoLintState,
+    tsgolint::{TsGoLintState, try_find_tsgolint_executable},
     utils::{read_to_arena_str, read_to_string},
 };
 use crate::{

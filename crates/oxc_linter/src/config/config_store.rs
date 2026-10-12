@@ -7,6 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     AllowWarnDeny,
+    cache::Fingerprint,
     external_plugin_store::{ExternalOptionsId, ExternalPluginStore, ExternalRuleId},
     rules::{RULES, RuleEnum},
 };
@@ -75,6 +76,12 @@ pub struct Config {
 
     /// An optional set of overrides to apply to the base state depending on the file being linted.
     pub(crate) overrides: ResolvedOxlintOverrides,
+
+    /// Fingerprint of the configuration this was built from, used by [`LintCache`] to detect
+    /// configuration changes.
+    ///
+    /// [`LintCache`]: crate::LintCache
+    pub(crate) fingerprint: Fingerprint,
 }
 
 impl Config {
@@ -108,7 +115,14 @@ impl Config {
             base_rules: rules,
             categories,
             overrides,
+            fingerprint: Fingerprint::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_fingerprint(mut self, fingerprint: Fingerprint) -> Self {
+        self.fingerprint = fingerprint;
+        self
     }
 
     pub fn plugins(&self) -> LintPlugins {
@@ -407,6 +421,11 @@ impl ConfigStore {
     // for the `tsgolint` linter.
     pub fn resolve(&self, path: &Path) -> ResolvedLinterState {
         Config::apply_overrides(self.get_related_config(path), path)
+    }
+
+    /// Fingerprint of the configuration that applies to the file at `path`.
+    pub fn fingerprint(&self, path: &Path) -> Fingerprint {
+        self.get_related_config(path).fingerprint
     }
 
     fn get_nearest_config(&self, path: &Path) -> Option<&Config> {

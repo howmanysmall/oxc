@@ -19,8 +19,8 @@ use oxc_span::{SourceType, Span};
 use super::{AllowWarnDeny, ConfigStore, DisableDirectives, ResolvedLinterState, read_to_string};
 
 use crate::{
-    CompositeFix, FixKind, Fixer, Message, PossibleFixes, RuleTimingRecord, RuleTimingSource,
-    RuleTimingStore, WEBSITE_BASE_RULES_URL, suppression::DiffManager,
+    CompositeFix, FixKind, Fixer, LintCache, Message, PossibleFixes, RuleTimingRecord,
+    RuleTimingSource, RuleTimingStore, WEBSITE_BASE_RULES_URL, suppression::DiffManager,
 };
 
 /// State required to initialize the `tsgolint` linter.
@@ -47,6 +47,8 @@ pub struct TsGoLintState {
     timings: bool,
     /// If `true`, the linter will create "ignore this section / line" fixes for all diagnostics
     with_ignore_fixes: bool,
+    /// Records results of linted files, if caching is enabled.
+    cache: Option<Arc<LintCache>>,
 }
 
 impl TsGoLintState {
@@ -65,6 +67,7 @@ impl TsGoLintState {
             type_check_only: false,
             timings: false,
             with_ignore_fixes: false,
+            cache: None,
         }
     }
 
@@ -90,6 +93,7 @@ impl TsGoLintState {
             type_check_only: false,
             timings: false,
             with_ignore_fixes: false,
+            cache: None,
         })
     }
 
@@ -100,6 +104,13 @@ impl TsGoLintState {
     #[must_use]
     pub fn with_silent(mut self, yes: bool) -> Self {
         self.silent = yes;
+        self
+    }
+
+    /// Record the results of linted files in `cache`.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Option<Arc<LintCache>>) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -179,6 +190,7 @@ impl TsGoLintState {
         let sender_for_fixes = error_sender.clone();
 
         let diff_manager_clone_to_ts_go = Arc::<DiffManager>::clone(diff_manager);
+        let cache = self.cache.clone();
 
         let handler = std::thread::spawn(move || {
             let mut child = self.spawn_tsgolint(&json_input)?;
@@ -190,8 +202,13 @@ impl TsGoLintState {
                 let disable_directives_map =
                     disable_directives_map.lock().expect("disable_directives_map mutex poisoned");
 
-                let mut diagnostic_handler =
-                    DiagnosticHandler::new(self.cwd.clone(), self.silent, should_fix, error_sender);
+                let mut diagnostic_handler = DiagnosticHandler::new(
+                    self.cwd.clone(),
+                    self.silent,
+                    should_fix,
+                    error_sender,
+                    self.cache.clone(),
+                );
                 let mut timings = vec![];
 
                 let msg_iter = TsGoLintMessageStream::new(stdout);
@@ -309,6 +326,9 @@ impl TsGoLintState {
                     if fix_result.fixed
                         && let Err(error) = file_system.write_file(&path, &fix_result.fixed_code)
                     {
+                        if let Some(cache) = &cache {
+                            cache.record_failure(&path);
+                        }
                         sender_for_fixes
                             .send(vec![
                                 OxcDiagnostic::error(format!(
@@ -320,6 +340,13 @@ impl TsGoLintState {
                             .expect("Failed to send diagnostics");
                     }
 
+                    if let Some(cache) = &cache {
+                        cache.record(
+                            &path,
+                            fix_result.messages.iter().map(|message| &message.error),
+                            true,
+                        );
+                    }
                     if fix_result.messages.is_empty() {
                         diff_manager.collect_empty_file(path.as_path(), &cwd);
                     } else {
@@ -1069,10 +1096,18 @@ struct DiagnosticHandler {
     /// Messages requiring fixes, grouped by file path: messages.
     messages_requiring_fixes: FxHashMap<PathBuf, Vec<Message>>,
     messages_not_requiring_fixes: FxHashMap<PathBuf, Vec<(TsGoLintRuleDiagnostic, AllowWarnDeny)>>,
+    /// Records results of linted files, if caching is enabled.
+    cache: Option<Arc<LintCache>>,
 }
 
 impl DiagnosticHandler {
-    fn new(cwd: PathBuf, silent: bool, should_fix: bool, error_sender: DiagnosticSender) -> Self {
+    fn new(
+        cwd: PathBuf,
+        silent: bool,
+        should_fix: bool,
+        error_sender: DiagnosticSender,
+        cache: Option<Arc<LintCache>>,
+    ) -> Self {
         Self {
             cwd,
             silent,
@@ -1082,6 +1117,7 @@ impl DiagnosticHandler {
             error_sender,
             messages_requiring_fixes: FxHashMap::default(),
             messages_not_requiring_fixes: FxHashMap::default(),
+            cache,
         }
     }
 
@@ -1127,6 +1163,13 @@ impl DiagnosticHandler {
         let file_path = e.file_path.clone();
         let oxc_diagnostic: OxcDiagnostic = e.into();
 
+        if let Some(cache) = &self.cache {
+            match &file_path {
+                Some(file_path) => cache.record(file_path, [&oxc_diagnostic], false),
+                None => cache.record_unattributed_error(),
+            }
+        }
+
         let diagnostics = if let Some(ref file_path) = file_path {
             let source_text = self.get_source_text(file_path).to_string();
             DiagnosticService::wrap_diagnostics(
@@ -1153,6 +1196,9 @@ impl DiagnosticHandler {
         } else {
             Severity::Warning
         });
+        if let Some(cache) = &self.cache {
+            cache.record(path, [&oxc_diagnostic], true);
+        }
         let source = self.named_source(path);
         self.error_sender
             .send(vec![oxc_diagnostic.with_source_code(source)])
@@ -1188,27 +1234,27 @@ impl DiagnosticHandler {
                         }
                     });
 
+                    let messages = messages
+                        .iter()
+                        .cloned()
+                        .map(|(diagnostic, severity)| {
+                            let mut message = Message::from_tsgo_lint_diagnostic(
+                                diagnostic,
+                                source_text.as_str(),
+                            );
+                            message.error.severity = if severity == AllowWarnDeny::Deny {
+                                Severity::Error
+                            } else {
+                                Severity::Warning
+                            };
+                            message
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(cache) = &self.cache {
+                        cache.record(&path, messages.iter().map(|message| &message.error), true);
+                    }
                     let filtered_messages: Vec<OxcDiagnostic> = diff_manager
-                        .collect_file(
-                            path.as_path(),
-                            self.cwd.as_path(),
-                            messages
-                                .iter()
-                                .cloned()
-                                .map(|(diagnostic, severity)| {
-                                    let mut message = Message::from_tsgo_lint_diagnostic(
-                                        diagnostic,
-                                        source_text.as_str(),
-                                    );
-                                    message.error.severity = if severity == AllowWarnDeny::Deny {
-                                        Severity::Error
-                                    } else {
-                                        Severity::Warning
-                                    };
-                                    message
-                                })
-                                .collect(),
-                        )
+                        .collect_file(path.as_path(), self.cwd.as_path(), messages)
                         .into_iter()
                         .map(Into::into)
                         .collect();
@@ -1221,6 +1267,9 @@ impl DiagnosticHandler {
                     );
                     self.error_sender.send(diagnostics).expect("Failed to send diagnostics");
                 } else if !messages_requiring_fixes.contains_key(&path) {
+                    if let Some(cache) = &self.cache {
+                        cache.record(&path, [], true);
+                    }
                     diff_manager.collect_empty_file(path.as_path(), self.cwd.as_path());
                 }
             }
