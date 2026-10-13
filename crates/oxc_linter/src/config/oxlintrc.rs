@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use oxc_diagnostics::OxcDiagnostic;
 
-use crate::{AllowWarnDeny, LintPlugins, utils::read_to_string};
+use crate::{
+    AllowWarnDeny, LintPlugins,
+    cache::{Fingerprint, FingerprintHasher},
+    utils::read_to_string,
+};
 
 use super::{
     categories::OxlintCategories,
@@ -313,6 +317,29 @@ pub struct Oxlintrc {
 }
 
 impl Oxlintrc {
+    /// Fingerprint of this configuration as written, used by [`LintCache`] to detect
+    /// configuration changes. Combine it with the files it extends using
+    /// [`ConfigStoreBuilder::fingerprint`].
+    ///
+    /// [`LintCache`]: crate::LintCache
+    /// [`ConfigStoreBuilder::fingerprint`]: crate::ConfigStoreBuilder::fingerprint
+    pub fn fingerprint(&self) -> Fingerprint {
+        fn write(hasher: &mut FingerprintHasher, oxlintrc: &Oxlintrc) {
+            // The configuration file itself, for anything its serialized form leaves out.
+            hasher.write_file(&oxlintrc.path);
+            hasher.write_json(oxlintrc);
+            // Not serialized with the rest of the configuration.
+            hasher.write_json(&oxlintrc.settings.json);
+            for config in &oxlintrc.extends_configs {
+                write(hasher, config);
+            }
+        }
+
+        let mut hasher = FingerprintHasher::default();
+        write(&mut hasher, self);
+        hasher.finish()
+    }
+
     /// # Errors
     ///
     /// * Parse Failure

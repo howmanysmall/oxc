@@ -13,6 +13,7 @@ use oxc_str::{CompactStr, format_compact_str};
 use crate::{
     AllowWarnDeny, ExternalPluginStore, LintConfig, LintFilter, LintFilterKind, Oxlintrc,
     RuleCategory, RuleEnum,
+    cache::{Fingerprint, FingerprintHasher},
     config::{
         ESLintRule, OxlintOverrides, OxlintRules,
         external_plugins::ExternalPluginEntry,
@@ -579,6 +580,23 @@ impl ConfigStoreBuilder {
             })
             .map(|rule| (rule.clone(), AllowWarnDeny::Warn))
             .collect()
+    }
+
+    /// Fingerprint of the configuration, used by [`LintCache`] to detect configuration changes.
+    ///
+    /// Combines `oxlintrc`, the [`Oxlintrc::fingerprint`] of the configuration this builder was
+    /// created from, with the configuration files it extends. Not computed while building, so
+    /// that only runs with a cache pay for it.
+    ///
+    /// [`LintCache`]: crate::LintCache
+    pub fn fingerprint(&self, oxlintrc: Fingerprint) -> Fingerprint {
+        let mut hasher = FingerprintHasher::default();
+        hasher.write_fingerprint(oxlintrc);
+        // Extended configuration files, including the ones they extend.
+        for path in &self.extended_paths {
+            hasher.write_file(path);
+        }
+        hasher.finish()
     }
 
     /// # Panics
@@ -1812,6 +1830,67 @@ mod test {
         .unwrap()
         .build(&mut external_plugin_store)
         .unwrap()
+    }
+
+    fn fingerprint_of(json: &str) -> crate::Fingerprint {
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let oxlintrc: Oxlintrc = serde_json::from_str(json).unwrap();
+        let fingerprint = oxlintrc.fingerprint();
+        ConfigStoreBuilder::from_oxlintrc(false, oxlintrc, None, &mut external_plugin_store, None)
+            .unwrap()
+            .fingerprint(fingerprint)
+    }
+
+    #[test]
+    fn fingerprint_detects_configuration_changes() {
+        let config = r#"{ "rules": { "no-console": "error", "eqeqeq": ["error", "smart"] } }"#;
+        // Key order doesn't matter.
+        let reordered = r#"{ "rules": { "eqeqeq": ["error", "smart"], "no-console": "error" } }"#;
+        let changed_severity =
+            r#"{ "rules": { "no-console": "warn", "eqeqeq": ["error", "smart"] } }"#;
+        let changed_options =
+            r#"{ "rules": { "no-console": "error", "eqeqeq": ["error", "always"] } }"#;
+
+        // Arbitrary settings are not serialized with the rest of the configuration.
+        let settings_a = r#"{ "settings": { "react-hooks": { "additionalEffectHooks": "a" } } }"#;
+        let settings_b = r#"{ "settings": { "react-hooks": { "additionalEffectHooks": "b" } } }"#;
+
+        assert_eq!(fingerprint_of(config), fingerprint_of(config));
+        assert_ne!(fingerprint_of(settings_a), fingerprint_of(settings_b));
+        assert_eq!(fingerprint_of(config), fingerprint_of(reordered));
+        assert_ne!(fingerprint_of(config), fingerprint_of(changed_severity));
+        assert_ne!(fingerprint_of(config), fingerprint_of(changed_options));
+    }
+
+    #[test]
+    fn fingerprint_covers_extended_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("oxc_linter_fingerprint_extends_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.json");
+        let config_path = dir.join(".oxlintrc.json");
+        std::fs::write(&config_path, r#"{ "extends": ["./base.json"] }"#).unwrap();
+        let fingerprint = || {
+            let oxlintrc = Oxlintrc::from_file(&config_path).unwrap();
+            let fingerprint = oxlintrc.fingerprint();
+            let mut external_plugin_store = ExternalPluginStore::default();
+            ConfigStoreBuilder::from_oxlintrc(
+                false,
+                oxlintrc,
+                None,
+                &mut external_plugin_store,
+                None,
+            )
+            .unwrap()
+            .fingerprint(fingerprint)
+        };
+
+        std::fs::write(&base, r#"{ "rules": { "no-console": "error" } }"#).unwrap();
+        let before = fingerprint();
+        std::fs::write(&base, r#"{ "rules": { "no-console": "warn" } }"#).unwrap();
+        let after = fingerprint();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_ne!(before, after);
     }
 
     fn config_store_from_str(s: &str) -> Config {

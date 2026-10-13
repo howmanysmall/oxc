@@ -81,6 +81,11 @@ impl ExternalPluginStore {
         self.plugins.is_empty()
     }
 
+    /// Paths of all registered plugins, in no particular order.
+    pub fn plugin_paths(&self) -> impl Iterator<Item = &Path> {
+        self.registered_plugin_paths.iter().map(PathBuf::as_path)
+    }
+
     pub fn is_plugin_registered(&self, plugin_path: &Path) -> bool {
         self.registered_plugin_paths.contains(plugin_path)
     }

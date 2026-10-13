@@ -89,6 +89,15 @@ impl LintService {
         self.runtime.set_disable_directives_map(map);
     }
 
+    /// Record the results of linted files in `cache`.
+    pub fn set_cache(&mut self, cache: Option<Arc<crate::LintCache>>) {
+        self.runtime.cache = cache;
+    }
+
+    pub(crate) fn linter(&self) -> &crate::Linter {
+        &self.runtime.linter
+    }
+
     pub fn run_source(
         &self,
         file_system: &(dyn RuntimeFileSystem + Sync + Send),

@@ -252,6 +252,8 @@ pub struct ConfigLoader<'a> {
     external_plugin_store: &'a mut ExternalPluginStore,
     filters: &'a [LintFilter],
     workspace_uri: Option<&'a str>,
+    /// Compute configuration fingerprints, for the lint cache.
+    fingerprints: bool,
     #[cfg(feature = "napi")]
     #[expect(clippy::struct_field_names)]
     js_config_loader: Option<&'a js_config::JsConfigLoaderCb>,
@@ -276,9 +278,17 @@ impl<'a> ConfigLoader<'a> {
             external_plugin_store,
             filters,
             workspace_uri,
+            fingerprints: false,
             #[cfg(feature = "napi")]
             js_config_loader: None,
         }
+    }
+
+    /// Compute a fingerprint of each loaded configuration, for the lint cache.
+    #[must_use]
+    pub fn with_fingerprints(mut self, fingerprints: bool) -> Self {
+        self.fingerprints = fingerprints;
+        self
     }
 
     #[cfg(feature = "napi")]
@@ -443,6 +453,7 @@ impl<'a> ConfigLoader<'a> {
                 }
             }
 
+            let oxlintrc_fingerprint = self.fingerprints.then(|| config.fingerprint());
             let builder = match ConfigStoreBuilder::from_oxlintrc(
                 false,
                 config,
@@ -458,10 +469,16 @@ impl<'a> ConfigLoader<'a> {
             };
 
             let extended_paths = builder.extended_paths.clone();
+            let fingerprint =
+                oxlintrc_fingerprint.map(|fingerprint| builder.fingerprint(fingerprint));
 
             match builder
                 .with_filters(self.filters)
                 .build(self.external_plugin_store)
+                .map(|config| match fingerprint {
+                    Some(fingerprint) => config.with_fingerprint(fingerprint),
+                    None => config,
+                })
                 .map_err(|e| ConfigLoadError::Build { path: path.clone(), error: e.to_string() })
             {
                 Ok(config) => built_configs.push(LoadedConfig {

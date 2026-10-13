@@ -28,7 +28,7 @@ use oxc_span::{SourceType, VALID_EXTENSIONS};
 use oxc_str::CompactStr;
 
 use crate::{
-    Fixer, Linter, Message, PossibleFixes, RuleTimingStore,
+    Fixer, LintCache, Linter, Message, PossibleFixes, RuleTimingStore,
     context::{ContextSubHost, ContextSubHostOptions},
     disable_directives::DisableDirectives,
     loader::{JavaScriptSource, LINT_PARTIAL_LOADER_EXTENSIONS, PartialLoader},
@@ -66,6 +66,8 @@ pub struct Runtime {
     modules_by_path: ModulesByPath,
     /// Collected disable directives from linted files
     disable_directives_map: Arc<Mutex<FxHashMap<PathBuf, DisableDirectives>>>,
+    /// Records results of linted files, if caching is enabled.
+    pub(super) cache: Option<Arc<LintCache>>,
 }
 
 /// Output of `Runtime::process_path`
@@ -270,6 +272,7 @@ impl Runtime {
                 .resize_mode(papaya::ResizeMode::Blocking)
                 .build(),
             disable_directives_map: Arc::new(Mutex::new(FxHashMap::default())),
+            cache: None,
         }
     }
 
@@ -653,6 +656,9 @@ impl Runtime {
                                     },
                                 )),
                                 Err(messages) => {
+                                    if let Some(cache) = &me.cache {
+                                        cache.record(path, &messages, false);
+                                    }
                                     if !messages.is_empty() {
                                         let diagnostics = DiagnosticService::wrap_diagnostics(
                                             &me.cwd,
@@ -709,6 +715,9 @@ impl Runtime {
                             messages = fix_result.messages;
                         }
 
+                        if let Some(cache) = &me.cache {
+                            cache.record(path, messages.iter().map(|message| &message.error), true);
+                        }
                         if !diff_manager.skip() {
                             messages = diff_manager.collect_file(path, &self.cwd, messages);
                         }
@@ -729,6 +738,9 @@ impl Runtime {
                         if let Cow::Owned(new_source_text) = &new_source_text
                             && let Err(error) = file_system.write_file(path, new_source_text)
                         {
+                            if let Some(cache) = &me.cache {
+                                cache.record_failure(path);
+                            }
                             tx_error
                                 .send(vec![
                                     OxcDiagnostic::error(format!(
@@ -871,6 +883,13 @@ impl Runtime {
                                 match record_result {
                                     Ok(_) => {}
                                     Err(diagnostics) => {
+                                        if let Some(cache) = &me.cache {
+                                            cache.record(
+                                                Path::new(&module_to_lint.path),
+                                                &diagnostics,
+                                                false,
+                                            );
+                                        }
                                         if !diagnostics.is_empty() {
                                             let wrapped = DiagnosticService::wrap_diagnostics(
                                                 &me.cwd,
@@ -1012,6 +1031,9 @@ impl Runtime {
                 let (source_type, source_text) = match stt {
                     Ok(v) => v,
                     Err(e) => {
+                        if let Some(cache) = &self.cache {
+                            cache.record_failure(Path::new(path));
+                        }
                         if let Some(tx_error) = tx_error {
                             tx_error.send(vec![e]).unwrap();
                         }

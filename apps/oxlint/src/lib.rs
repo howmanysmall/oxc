@@ -14,6 +14,8 @@ mod utils;
 mod walk;
 
 #[cfg(test)]
+mod cache_test;
+#[cfg(test)]
 mod tester;
 
 /// Re-exported CLI-related items for use in `tasks/website`.

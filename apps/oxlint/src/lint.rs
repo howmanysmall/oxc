@@ -17,15 +17,17 @@ use oxc_diagnostics::{
 };
 use oxc_linter::{
     AllowWarnDeny, ConfigBuilderError, ConfigStore, ConfigStoreBuilder, ExternalLinter,
-    ExternalPluginStore, InvalidFilterKind, LintFilter, LintOptions, LintRunner,
-    LintServiceOptions, Linter, OxlintSuppressionFileAction, RuleTimingStore, SuppressionManager,
+    ExternalPluginStore, Fingerprint, FingerprintHasher, InvalidFilterKind, LintCache, LintFilter,
+    LintOptions, LintRunner, LintServiceOptions, Linter, OxlintSuppressionFileAction,
+    RuleTimingStore, SuppressionManager, try_find_tsgolint_executable,
 };
 
 #[cfg(feature = "napi")]
 use crate::js_config::JsConfigLoaderCb;
 use crate::{
     cli::{
-        CliRunResult, DebugOption, LintCommand, MiscOptions, ReportUnusedDirectives, WarningOptions,
+        CacheOptions, CliRunResult, DebugOption, LintCommand, MiscOptions, ReportUnusedDirectives,
+        WarningOptions,
     },
     config_loader::{
         CliConfigLoadError, ConfigLoadError, ConfigLoader, config_discovery,
@@ -93,6 +95,7 @@ impl CliRunner {
             disable_nested_config,
             inline_config_options,
             suppression_options,
+            cache_options,
             ..
         } = self.options;
 
@@ -253,7 +256,8 @@ impl CliRunner {
 
         let config_result = {
             let mut config_loader =
-                ConfigLoader::new(external_linter, &mut external_plugin_store, &filters, None);
+                ConfigLoader::new(external_linter, &mut external_plugin_store, &filters, None)
+                    .with_fingerprints(cache_options.cache);
             #[cfg(feature = "napi")]
             {
                 config_loader = config_loader.with_js_config_loader(self.js_config_loader.as_ref());
@@ -348,8 +352,14 @@ impl CliRunner {
             return crate::mode::run_print_config(&config_builder, root_config, stdout);
         }
 
+        let root_fingerprint =
+            cache_options.cache.then(|| config_builder.fingerprint(root_config.fingerprint()));
+
         let lint_config = match config_builder.build(&mut external_plugin_store) {
-            Ok(config) => config,
+            Ok(config) => match root_fingerprint {
+                Some(fingerprint) => config.with_fingerprint(fingerprint),
+                None => config,
+            },
             Err(e) => {
                 print_and_flush_stdout(
                     stdout,
@@ -478,6 +488,27 @@ impl CliRunner {
             }
         }
 
+        let lint_cache = Self::load_cache(&cache_options, &self.cwd, || {
+            let mut settings = FingerprintHasher::default();
+            settings.write_str(env!("CARGO_PKG_VERSION"));
+            settings.write_str(&format!(
+                "{filters:?} {report_unused_directives:?} {type_aware} {type_check} {type_check_only}"
+            ));
+            if let Some(tsconfig) = &basic_options.tsconfig {
+                settings.write_file(&self.cwd.join(tsconfig));
+            }
+            if type_aware && let Ok(tsgolint) = try_find_tsgolint_executable(&self.cwd) {
+                settings.write_file_metadata(&tsgolint);
+            }
+            let mut plugin_paths =
+                config_store.external_plugin_store().plugin_paths().collect::<Vec<_>>();
+            plugin_paths.sort_unstable();
+            for plugin_path in plugin_paths {
+                settings.write_file_metadata(plugin_path);
+            }
+            settings.finish()
+        });
+
         let linter = Linter::new(LintOptions::default(), config_store, external_linter)
             .with_fix(fix_options.fix_kind())
             .with_report_unused_directives(report_unused_directives);
@@ -526,6 +557,7 @@ impl CliRunner {
             .with_fix_kind(fix_options.fix_kind())
             .with_type_check_only(type_check_only)
             .with_timings(debug_timings)
+            .with_cache(lint_cache.clone())
             .build()
         {
             Ok(runner) => runner,
@@ -552,6 +584,9 @@ impl CliRunner {
         match lint_result {
             Ok(lint_runner) => {
                 lint_runner.report_unused_directives(report_unused_directives, &tx_error);
+                if let Some(lint_cache) = &lint_cache {
+                    Self::save_cache(lint_cache);
+                }
             }
             Err(err) => {
                 print_and_flush_stdout(stdout, &format!("{err}\n"));
@@ -633,6 +668,48 @@ impl CliRunner {
     pub fn with_config_loader(mut self, config_loader: Option<JsConfigLoaderCb>) -> Self {
         self.js_config_loader = config_loader;
         self
+    }
+
+    /// Load the lint cache if `--cache` is enabled. Otherwise delete the cache file, like ESLint.
+    fn load_cache(
+        options: &CacheOptions,
+        cwd: &Path,
+        settings: impl FnOnce() -> Fingerprint,
+    ) -> Option<Arc<LintCache>> {
+        // Like ESLint, a directory gets a cache file named after the working directory.
+        let path = match &options.cache_location {
+            None => cwd.join(".oxlintcache"),
+            Some(location) => {
+                let path = cwd.join(location);
+                let is_dir = path.is_dir()
+                    || location
+                        .as_os_str()
+                        .to_string_lossy()
+                        .ends_with(['/', std::path::MAIN_SEPARATOR]);
+                if is_dir {
+                    let cwd = cwd.as_os_str().as_encoded_bytes();
+                    path.join(format!(".cache_{}", Fingerprint::of_bytes(cwd)))
+                } else {
+                    path
+                }
+            }
+        };
+
+        if !options.cache {
+            if path.is_file() {
+                let _ = std::fs::remove_file(&path);
+            }
+            return None;
+        }
+
+        Some(Arc::new(LintCache::load(path, cwd.to_path_buf(), options.cache_strategy, settings())))
+    }
+
+    #[expect(clippy::print_stderr)]
+    fn save_cache(lint_cache: &LintCache) {
+        if let Err(error) = lint_cache.save() {
+            eprintln!("Failed to write the lint cache: {error}");
+        }
     }
 
     fn get_diagnostic_service(

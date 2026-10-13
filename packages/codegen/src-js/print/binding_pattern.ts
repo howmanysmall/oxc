@@ -2,7 +2,13 @@
 
 import { typeAssertIs } from "../asserts.ts";
 import { CAT_CLOSE_BRACKET, CAT_OTHER, CAT_QUESTION } from "./categories.ts";
-import { write, writeWithMap, writeWithMapNamed, writeWithMapNamedPrivate } from "./write.ts";
+import {
+  write,
+  writeNoLast,
+  writeWithMap,
+  writeWithMapNamed,
+  writeWithMapNamedPrivate,
+} from "./write.ts";
 import { printExpression } from "./expression.ts";
 import { printSpaceBeforeIdentifier } from "./space.ts";
 import { printLiteral } from "./literal.ts";
@@ -170,34 +176,44 @@ export function printPropertyKey(key: ESTree.PropertyKey, state: State): void {
  * @param state - Printer state
  */
 function printArrayBindingPattern(node: ESTree.ArrayPattern, state: State): void {
-  // Oxc stores the rest element separately from the other elements.
-  // A trailing comma is printed before it, and a space always precedes it.
-  const { elements } = node;
-  let { length } = elements;
-
-  let rest: ESTree.BindingRestElement | ESTree.AssignmentTargetRest | null = null;
-  if (length > 0) {
-    const lastElement = elements[length - 1];
-    if (lastElement != null && lastElement.type === "RestElement") {
-      rest = lastElement;
-      length--;
-    }
-  }
-
   writeWithMap(state, "[", CAT_OTHER, node.start, node.end, node);
 
-  for (let i = 0; i < length; i++) {
-    if (i !== 0) write(state, ", ", CAT_OTHER);
+  const { elements } = node,
+    { length } = elements;
 
-    const element = elements[i];
-    if (element != null) printBindingPattern(element, state);
+  if (length !== 0) {
+    const lastElement = elements[length - 1];
+    if (lastElement !== null && lastElement.type === "RestElement") {
+      // Print elements before the `RestElement`
+      const restIndex = length - 1;
+      for (let i = 0; i < restIndex; i++) {
+        const element = elements[i];
+        if (element !== null) printBindingPattern(element, state);
+        write(state, ", ", CAT_OTHER);
+      }
 
-    if (i === length - 1 && (element == null || rest !== null)) write(state, ",", CAT_OTHER);
-  }
+      // Print `RestElement`
+      writeWithMap(state, "...", CAT_OTHER, lastElement.start, lastElement.end, lastElement);
+      printBindingPattern(lastElement.argument, state);
+      if (TS) {
+        const { typeAnnotation } = lastElement;
+        if (typeAnnotation != null) printTypeAnnotation(typeAnnotation, state);
+      }
+    } else {
+      // No `RestElement` - print all elements
+      const firstElement = elements[0];
+      if (firstElement !== null) printBindingPattern(firstElement, state);
 
-  if (rest !== null) {
-    write(state, " ", CAT_OTHER);
-    printBindingPattern(rest, state);
+      for (let i = 1; i < length; i++) {
+        write(state, ", ", CAT_OTHER);
+
+        const element = elements[i];
+        if (element !== null) printBindingPattern(element, state);
+      }
+
+      // A trailing hole needs a comma after it
+      if (lastElement === null) writeNoLast(state, ",");
+    }
   }
 
   write(state, "]", CAT_CLOSE_BRACKET);
